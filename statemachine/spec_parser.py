@@ -5,6 +5,11 @@ from collections.abc import Callable
 from functools import reduce
 from inspect import isawaitable
 
+from .state_queries import build_child_call
+from .state_queries import build_is_done_call
+from .state_queries import is_state_active
+from .state_queries import make_state_path
+
 replacements = {"!": "not ", "^": " and ", "v": " or "}
 
 pattern = re.compile(r"\!(?!=)|\^|\bv\b")
@@ -124,6 +129,7 @@ def build_constant(constant) -> Callable:
 
 class Functions:
     registry: dict[str, Callable] = {}
+    guard_registry: dict[str, Callable] = {}
 
     @classmethod
     def register(cls, id) -> Callable:
@@ -134,11 +140,26 @@ class Functions:
         return register
 
     @classmethod
-    def get(cls, func_id):
+    def register_guard(cls, id) -> Callable:
+        """Register a function available only to native boolean guard expressions."""
+
+        def register(func):
+            key = id.lower()
+            if key in cls.registry or key in cls.guard_registry:
+                raise ValueError(f"Expression function {key!r} is already registered")
+            cls.guard_registry[key] = func
+            return func
+
+        return register
+
+    @classmethod
+    def get(cls, func_id, *, allow_guard_functions=False):
         func_id = func_id.lower()
-        if func_id not in cls.registry:
-            raise UnsupportedExpression(f"Unsupported function: {func_id}")
-        return cls.registry[func_id]
+        if func_id in cls.registry:
+            return cls.registry[func_id]
+        if allow_guard_functions and func_id in cls.guard_registry:
+            return cls.guard_registry[func_id]
+        raise UnsupportedExpression(f"Unsupported function: {func_id}")
 
 
 class InState:
@@ -146,7 +167,7 @@ class InState:
         self.machine = machine
 
     def __call__(self, *state_ids: str):
-        return set(state_ids).issubset({s.id for s in self.machine.configuration})
+        return all(is_state_active(self.machine, state_ref) for state_ref in state_ids)
 
 
 @Functions.register("in")
@@ -160,6 +181,13 @@ def build_in_call(*state_ids: str) -> Callable:
     decorated.__name__ = f"in({state_ids_set})"
     decorated.unique_key = f"in({state_ids_set})"  # type: ignore[attr-defined]
     return decorated
+
+
+# Guard-only built-ins. They are deliberately excluded from parse_expr(), which
+# is also used by the restricted external datamodel evaluator.
+Functions.register_guard("is_done")(build_is_done_call)
+Functions.register_guard("child")(build_child_call)
+Functions.register_guard("path")(make_state_path)
 
 
 def build_custom_operator(operator) -> Callable:
@@ -242,7 +270,11 @@ def build_attribute(value_expr: Callable, attr: str) -> Callable:
 
 
 def build_expression(  # noqa: C901
-    node, variable_hook, operator_mapping, allow_value_nodes: bool = False
+    node,
+    variable_hook,
+    operator_mapping,
+    allow_value_nodes: bool = False,
+    allow_guard_functions: bool = False,
 ):
     """Build a callable from an AST node using an allowlist of allowed structures.
 
@@ -255,7 +287,35 @@ def build_expression(  # noqa: C901
     """
 
     def recurse(child):
-        return build_expression(child, variable_hook, operator_mapping, allow_value_nodes)
+        return build_expression(
+            child,
+            variable_hook,
+            operator_mapping,
+            allow_value_nodes,
+            allow_guard_functions,
+        )
+
+    def call_argument(argument, *, allow_path: bool):
+        if isinstance(argument, ast.Constant):
+            return argument.value
+        if isinstance(argument, ast.Call) and isinstance(argument.func, ast.Name):
+            if argument.func.id.lower() == "path":
+                if not allow_guard_functions:
+                    raise UnsupportedExpression("Unsupported function: path")
+                if not allow_path:
+                    raise UnsupportedExpression("path() is only valid as an argument to In()")
+                if (
+                    len(argument.args) != 1
+                    or argument.keywords
+                    or not isinstance(argument.args[0], ast.Constant)
+                    or not isinstance(argument.args[0].value, str)
+                ):
+                    raise UnsupportedExpression("path() expects exactly one literal string")
+                constructor = Functions.get("path", allow_guard_functions=True)
+                return constructor(*(arg.value for arg in argument.args))
+        raise UnsupportedExpression(
+            "Function arguments must be literals; In() also accepts path('qualified.path')"
+        )
 
     match node:
         case ast.BoolOp():
@@ -278,12 +338,14 @@ def build_expression(  # noqa: C901
                 expressions.append(expression)
             return reduce(custom_and, expressions)
         case ast.Call(func=ast.Name(id=func_id)):
-            # Only allowlisted functions from the registry (e.g. ``In(...)``) are
-            # callable. Method calls (``obj.method()``) have an ``ast.Attribute``
-            # func and fall through to the ``case _`` guard below — this prevents
-            # using calls as a sandbox-escape vector.
-            constructor = Functions.get(func_id)
-            params = [arg.value for arg in node.args if isinstance(arg, ast.Constant)]
+            # Only allowlisted functions can be called. Guard-only functions are
+            # enabled by parse_boolean_expr(), never by the restricted parse_expr().
+            if node.keywords:
+                raise UnsupportedExpression("Keyword arguments are not supported in guard calls")
+            if func_id.lower() == "path":
+                raise UnsupportedExpression("path() is only valid as an argument to In()")
+            constructor = Functions.get(func_id, allow_guard_functions=allow_guard_functions)
+            params = [call_argument(arg, allow_path=func_id.lower() == "in") for arg in node.args]
             return constructor(*params)
         case ast.UnaryOp(op=ast.Not()):
             return operator_mapping[type(node.op)](recurse(node.operand))
@@ -340,7 +402,7 @@ def parse_boolean_expr(expr, variable_hook, operator_mapping):
         return variable_hook(expr)
     expr = replace_operators(expr)
     tree = ast.parse(expr, mode="eval")
-    return build_expression(tree.body, variable_hook, operator_mapping)
+    return build_expression(tree.body, variable_hook, operator_mapping, allow_guard_functions=True)
 
 
 def names_in_boolean_expr(expr: str) -> "set[str]":

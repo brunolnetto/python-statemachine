@@ -459,3 +459,50 @@ sets, and dictionaries, and instances of classes whose `__bool__()` or
 
 So `cond=lambda: []` evaluates as `False`.
 ```
+
+## Hierarchical state queries in guards
+
+Boolean guard expressions can query the current hierarchical configuration with
+three read-only operations:
+
+- `is_done(state_ref)` checks structural completion of a compound or parallel state.
+- `child(state_ref)` returns the active direct child ID of a compound state.
+- `In(...)` continues to test active local state IDs; wrap `path("...")` around a
+  qualified path to test exactly one node.
+
+A reference accepted by `is_done()` and `child()` is either a unique local state ID
+or a qualified dotted path. For example:
+
+```python
+cond = "is_done('pipeline.build') and child('pipeline.review') == 'approved'"
+```
+
+Literal dots and backslashes inside an ID must be escaped with a backslash. A bare
+ID that occurs more than once is ambiguous; use a qualified path instead. The error
+reports the candidate paths rather than choosing one branch implicitly.
+
+`child()` is defined only for compound states. It returns `None` when no direct child
+is active, and raises a definition error for parallel and atomic states. A parallel
+state has multiple active regions, so it has no single active child.
+
+The existing `In("passed")` syntax retains its local-ID semantics, including for
+repeated IDs: it is true when at least one state with that local ID is active.
+`In("a", "b")` still requires all arguments to be active. To test one exact node,
+write:
+
+```python
+cond = "In(path('pipeline.tests.passed'))"
+```
+
+The explicit `path(...)` wrapper is intentional: it distinguishes a hierarchical
+reference from an existing local ID that may itself contain dots.
+
+Completion uses the same structural rule as the engine's `is_in_final_state()`:
+compound states are complete when a direct final child is active; parallel states
+are complete when every direct region is recursively complete; atomic states are
+never structurally complete, including active final atomic states. These queries
+inspect the current configuration and do not emit `done.state` events or mutate
+history.
+
+These functions are available only in native boolean guards. They are not added to
+the restricted evaluator used for external SCXML/JSON/YAML datamodel expressions.

@@ -22,6 +22,7 @@ from ..invoke import InvokeManager
 from ..orderedset import OrderedSet
 from ..state import HistoryState
 from ..state import State
+from ..state_queries import is_in_final_state as _is_in_final_state
 from ..transition import Transition
 
 if TYPE_CHECKING:
@@ -956,7 +957,7 @@ class BaseEngine:
         self._root_parallel_final_pending = None
         # A done.state transition may have exited the parallel; verify it's
         # still in the configuration before terminating.
-        if state in self.sm.configuration and self.is_in_final_state(state):
+        if state.value in self.sm.configuration_values and self.is_in_final_state(state):
             self._invoke_manager.cancel_all()
             self.running = False
 
@@ -965,6 +966,4 @@ class BaseEngine:
 
         An atomic state has no children, so it never does.
         """
-        if state.parallel:
-            return all(self.is_in_final_state(s) for s in state.states)
-        return any(s.final and s in self.sm.configuration for s in state.states)
+        return _is_in_final_state(state, self.sm.configuration_values)
